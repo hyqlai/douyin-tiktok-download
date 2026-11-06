@@ -4,9 +4,9 @@
 Pure Python 3 standard library implementation.
 Zero third-party dependencies.
 
-Requires environment variables:
-  - DTK_BASE_URL: Base URL of the Douyin_TikTok_Download_API service
-  - DTK_API_KEY:  API Key with douyin:read / tiktok:read scopes
+The ONLY credential source is config.json in the skill root (the parent of
+this scripts/ directory). No environment variables, no absolute paths baked in:
+the skill works wherever its directory is placed, on Windows, Linux and macOS.
 """
 
 from __future__ import annotations
@@ -24,47 +24,102 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-ENV_BASE_URL = "DTK_BASE_URL"
-ENV_API_KEY = "DTK_API_KEY"
+CONFIG_FILENAME = "config.json"
+# 技能根目录由脚本位置推导，与当前工作目录、用户主目录、盘符均无关
+SKILL_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = SKILL_DIR / CONFIG_FILENAME
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 )
 
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
-def get_required_env() -> tuple[str, str]:
-    """Retrieve and strictly validate required environment variables."""
-    base_url = (os.environ.get(ENV_BASE_URL) or os.environ.get("DOUYIN_TIKTOK_API_BASE") or "").strip()
-    api_key = (os.environ.get(ENV_API_KEY) or os.environ.get("DOUYIN_TIKTOK_API_KEY") or "").strip()
 
-    missing = []
+class ConfigError(Exception):
+    """配置缺失或不合法，需向用户收集信息后重新生成 config.json。"""
+
+
+def is_http_url(value: str) -> bool:
+    """Basic shape check so a typo in base_url is reported as invalid config."""
+    parsed = urllib.parse.urlparse(value)
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def warn_if_insecure_permissions(config_path: Path) -> None:
+    """config.json 内含密钥；POSIX 下提醒收紧权限，Windows 依赖用户目录 ACL。"""
+    if os.name != "posix":
+        return
+    try:
+        mode = config_path.stat().st_mode
+    except OSError:
+        return
+    if mode & 0o077:
+        sys.stderr.write(
+            f"Warning: {CONFIG_FILENAME} 对其他用户可读；"
+            f"请在技能根目录执行 chmod 600 {CONFIG_FILENAME}\n"
+        )
+
+
+def load_config(config_path: Path | None = None) -> tuple[str, str]:
+    """从技能根目录的 config.json 读取凭据，任何其他来源都不参与。"""
+    path = config_path or CONFIG_PATH
+    if not path.is_file():
+        raise ConfigError(f"未找到配置文件 {CONFIG_FILENAME}")
+
+    # utf-8-sig 兼容 Windows 记事本保存时带 BOM 的 JSON
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{CONFIG_FILENAME} 不是合法 JSON: {e}") from e
+    except (OSError, UnicodeError) as e:
+        raise ConfigError(f"无法读取 {CONFIG_FILENAME}: {e}") from e
+
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{CONFIG_FILENAME} 顶层必须是 JSON 对象")
+
+    base_url = str(raw.get("base_url") or "").strip()
+    api_key = str(raw.get("api_key") or "").strip()
+    problems: list[str] = []
     if not base_url:
-        missing.append(f"{ENV_BASE_URL} (e.g., http://192.168.1.100:8000)")
+        problems.append("base_url 缺失")
+    elif not is_http_url(base_url):
+        problems.append("base_url 必须是 http:// 或 https:// 开头的地址")
     if not api_key:
-        missing.append(f"{ENV_API_KEY} (e.g., dtk_0a1b2c3d4e5f_...)")
+        problems.append("api_key 缺失")
+    if problems:
+        raise ConfigError("配置项无效: " + "、".join(problems))
 
-    if missing:
-        sys.stderr.write("Error: Missing required environment variables.\n")
-        sys.stderr.write("This tool does NOT provide default fallback values for security and neutrality.\n")
-        sys.stderr.write("Please set the following environment variables before running:\n")
-        for item in missing:
-            sys.stderr.write(f"  - export {item}\n")
-        sys.stderr.write("\nExample:\n")
-        sys.stderr.write("  export DTK_BASE_URL='http://your-server-address:8000'\n")
-        sys.stderr.write("  export DTK_API_KEY='dtk_your_secret_api_key'\n")
-        sys.exit(1)
-
+    warn_if_insecure_permissions(path)
     return base_url.rstrip("/"), api_key
 
 
+def config_status() -> dict[str, Any]:
+    """给 agent 自检用：只报告配置是否有效，绝不把密钥输出到对话或日志。"""
+    try:
+        load_config()
+    except ConfigError as e:
+        return {"configured": False, "config_file": CONFIG_FILENAME, "reason": str(e)}
+    return {"configured": True, "config_file": CONFIG_FILENAME}
+
+
 def sanitize_filename(name: str, max_length: int = 80) -> str:
-    """Sanitize string for safe filesystem filename."""
-    cleaned = re.sub(r'[\\/*?:"<>|\r\n\t]', "_", name)
+    """生成跨 Windows / Linux / macOS 都合法的文件名片段。"""
+    # Windows 禁用字符、ASCII 控制字符；macOS 禁冒号，Linux 禁斜杠与 NUL
+    cleaned = re.sub(r'[\\/*?:"<>|\x00-\x1f\x7f]', "_", name)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Windows 不允许以点或空格结尾，也不允许 CON/PRN/AUX/NUL/COM1.. 等设备名
+    cleaned = cleaned[:max_length].rstrip(". ")
     if not cleaned:
         cleaned = "untitled"
-    return cleaned[:max_length]
+    if cleaned.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+        cleaned = "_" + cleaned
+    return cleaned
 
 
 def extract_url(text: str) -> str:
@@ -231,7 +286,7 @@ def process_download(
     save_meta: bool = False,
 ) -> dict[str, Any]:
     """Execute end-to-end parsing and downloading workflow."""
-    base_url, api_key = get_required_env()
+    base_url, api_key = load_config()
     cleaned_url = extract_url(target_input)
 
     sys.stderr.write(f"Parsing URL: {cleaned_url}\n")
@@ -340,16 +395,26 @@ def process_download(
 
 
 def main() -> None:
+    # 非 UTF-8 locale（尤其是英文版 Windows 重定向输出时）避免中文提示触发编码异常
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Download Douyin & TikTok videos/images via REST API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Environment variables required:\n"
-            "  DTK_BASE_URL   Base URL of the service (e.g. http://127.0.0.1:8000)\n"
-            "  DTK_API_KEY    API Key for authentication (e.g. dtk_xxx)\n"
+            "Credentials come only from config.json in the skill root:\n"
+            '  {"base_url": "http://host:8000", "api_key": "dtk_xxx"}\n'
+            "See config.example.json. No environment variables are read.\n"
         ),
     )
-    parser.add_argument("url", help="Video URL or share text containing URL")
+    parser.add_argument("url", nargs="?", help="Video URL or share text containing URL")
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="Report whether config.json is valid, without printing the API key",
+    )
     parser.add_argument(
         "-o",
         "--output-dir",
@@ -362,6 +427,12 @@ def main() -> None:
     parser.add_argument("--json", action="store_true", help="Output summary in JSON format")
 
     args = parser.parse_args()
+
+    if args.check_config:
+        print(json.dumps(config_status(), ensure_ascii=False))
+        return
+    if not args.url:
+        parser.error("必须提供视频链接，或使用 --check-config 检查配置")
 
     out_dir = Path(args.output_dir).resolve()
     try:

@@ -1,18 +1,32 @@
 """Tests for the download.py script."""
 
+import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import scripts.download as download
 from scripts.download import (
+    CONFIG_PATH,
+    SKILL_DIR,
+    ConfigError,
+    config_status,
     extract_url,
-    get_required_env,
+    is_http_url,
+    load_config,
     sanitize_filename,
 )
+
+
+def write_config(directory: Path, content: str) -> Path:
+    cfg = directory / "config.json"
+    cfg.write_text(content, encoding="utf-8")
+    return cfg
 
 
 class TestDownloadScript(unittest.TestCase):
@@ -31,20 +45,76 @@ class TestDownloadScript(unittest.TestCase):
         self.assertEqual(sanitize_filename("   hello   world   "), "hello world")
         self.assertEqual(sanitize_filename(""), "untitled")
 
-    def test_env_validation_fails_when_missing(self):
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaises(SystemExit):
-                get_required_env()
+    def test_sanitize_filename_windows_compat(self):
+        self.assertEqual(sanitize_filename("name."), "name")
+        self.assertEqual(sanitize_filename("CON"), "_CON")
+        self.assertEqual(sanitize_filename("aux.txt"), "_aux.txt")
+        self.assertEqual(sanitize_filename("COM1"), "_COM1")
+        self.assertEqual(sanitize_filename("a\x00b\x1fc"), "a_b_c")
+        self.assertEqual(sanitize_filename("abcd." + "x" * 100, 5), "abcd")
 
-    def test_env_validation_succeeds_when_present(self):
-        with patch.dict(
-            os.environ,
-            {"DTK_BASE_URL": "http://1.2.3.4:8000/", "DTK_API_KEY": "dtk_test_123"},
-            clear=True,
-        ):
-            base_url, api_key = get_required_env()
-            self.assertEqual(base_url, "http://1.2.3.4:8000")
-            self.assertEqual(api_key, "dtk_test_123")
+    def test_config_path_is_relative_to_skill_dir(self):
+        self.assertEqual(CONFIG_PATH, SKILL_DIR / "config.json")
+        self.assertEqual(SKILL_DIR, Path(download.__file__).resolve().parent.parent)
+
+    def test_load_config_succeeds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_config(Path(tmp), json.dumps({
+                "base_url": "http://1.2.3.4:8000/",
+                "api_key": "dtk_test_key",
+            }))
+            self.assertEqual(load_config(cfg), ("http://1.2.3.4:8000", "dtk_test_key"))
+
+    def test_load_config_handles_windows_bom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_config(Path(tmp), '\ufeff{"base_url": "http://1.2.3.4:8000", "api_key": "k"}')
+            self.assertEqual(load_config(cfg), ("http://1.2.3.4:8000", "k"))
+
+    def test_load_config_rejects_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ConfigError):
+                load_config(Path(tmp) / "absent.json")
+
+    def test_load_config_rejects_invalid_json_and_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in ("not json", "[]", "{}", '{"base_url": "ftp://host", "api_key": "k"}'):
+                with self.subTest(content=content):
+                    cfg = write_config(Path(tmp), content)
+                    with self.assertRaises(ConfigError):
+                        load_config(cfg)
+
+    def test_is_http_url(self):
+        self.assertTrue(is_http_url("http://192.168.1.1:8000"))
+        self.assertTrue(is_http_url("https://api.example.com"))
+        self.assertFalse(is_http_url("192.168.1.1:8000"))
+        self.assertFalse(is_http_url("ftp://host"))
+
+    def test_config_status_never_leaks_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = write_config(Path(tmp), json.dumps({
+                "base_url": "http://1.2.3.4:8000",
+                "api_key": "dtk_super_secret",
+            }))
+            with patch.object(download, "CONFIG_PATH", cfg):
+                status = config_status()
+            self.assertTrue(status["configured"])
+            self.assertNotIn("dtk_super_secret", json.dumps(status))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(download, "CONFIG_PATH", Path(tmp) / "absent.json"):
+                status = config_status()
+            self.assertFalse(status["configured"])
+            self.assertIn("reason", status)
+
+    def test_environment_variables_are_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {"DTK_BASE_URL": "http://env:8000", "DTK_API_KEY": "dtk_env", "DTK_CONFIG": "/some/path"},
+                clear=True,
+            ):
+                with self.assertRaises(ConfigError):
+                    load_config(Path(tmp) / "absent.json")
 
 
 if __name__ == "__main__":

@@ -21,3 +21,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# 本地凭据配置：禁止加入版本管理，只提交模板
+config.json
+!config.example.json
